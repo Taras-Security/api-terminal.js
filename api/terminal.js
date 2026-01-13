@@ -1,177 +1,234 @@
-// api/terminal.js
-// Vercel Serverless Function
-export default async function handler(req, res) {
-  // ---------- CORS ----------
-  const origin = req.headers.origin || "";
-  const allowed = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+// /api/terminal.js
+// Vercel Serverless Function (Node)
+// Env vars:
+// - OPENAI_API_KEY   (required)
+// - OPENAI_MODEL     (optional, default "gpt-4.1-mini")
+// - ALLOWED_ORIGIN   (optional, comma-separated, e.g. "https://your.framer.website,https://yourdomain.com")
+// - TERMINAL_PERSONA (optional override)
 
-  const originAllowed =
-    !origin || // non-browser (curl/postman) has no origin
-    allowed.includes("*") ||
-    allowed.includes(origin);
+const OPENAI_URL = "https://api.openai.com/v1/responses"
 
-  // Always vary on Origin so caches don't poison responses
-  res.setHeader("Vary", "Origin");
+function parseAllowedOrigins() {
+  const raw = (process.env.ALLOWED_ORIGIN || "").trim()
+  if (!raw) return []
+  return raw.split(",").map((s) => s.trim()).filter(Boolean)
+}
 
-  if (origin && originAllowed) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
+function setCors(req, res) {
+  const origins = parseAllowedOrigins()
+  const origin = req.headers.origin
+
+  // If no ALLOWED_ORIGIN set, you can either allow all or allow none.
+  // For Framer, it's usually better to set ALLOWED_ORIGIN explicitly.
+  if (!origins.length) {
+    // permissive fallback
+    res.setHeader("Access-Control-Allow-Origin", "*")
+  } else if (origin && origins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin)
+    res.setHeader("Vary", "Origin")
   }
 
-  // If you want to allow credentials later, you'd also set:
-  // res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization")
+  res.setHeader("Access-Control-Max-Age", "86400")
+}
 
-  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+function readJsonBody(req) {
+  // Vercel usually parses JSON into req.body, but not always.
+  if (req.body && typeof req.body === "object") return req.body
+  if (typeof req.body === "string") {
+    try {
+      return JSON.parse(req.body)
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+function buildInstructions({ mode, tone, personaOverride }) {
+  const BASE_PERSONA =
+    (personaOverride && String(personaOverride).trim()) ||
+    (process.env.TERMINAL_PERSONA && process.env.TERMINAL_PERSONA.trim()) ||
+    `
+You are PSYOPANIME AI TERMINAL — an anime/news ops analyst that turns user input into anime-styled intel outputs.
+You do NOT talk like a generic assistant. You write like a clandestine anime briefing system.
+No “as an AI” disclaimers. No cringe. No filler.
+Always produce useful structure. Keep it tight.
+
+If the user gives a topic, you:
+- Identify what happened
+- Give the angle
+- Give implications
+- Give a hooky “X POST” at the end that matches the selected tone.
+`.trim()
+
+  const toneRules = {
+    CINEMATIC:
+      "Tone: cinematic, dramatic, clean. Sharp lines. Controlled hype. No clown emojis.",
+    SERIOUS:
+      "Tone: serious, factual, restrained. No hype. No memes unless requested.",
+    UNHINGED:
+      "Tone: unhinged, chaotic, funny, but still coherent and useful. Light meme energy allowed.",
+  }[tone] || "Tone: cinematic, dramatic, clean."
+
+  const modeRules = {
+    OPS_BRIEF: `
+Output format:
+TITLE:
+SUMMARY: (2–4 lines)
+KEY FACTS: (bullets)
+RISK / ANGLE: (bullets)
+NEXT ACTION: (bullets)
+X POST: (one post, <= 280 chars)
+`.trim(),
+    EPISODE_OUTLINE: `
+Output format:
+TITLE:
+LOGLINE: (1–2 lines)
+CAST: (3–6 roles)
+ACT 1:
+ACT 2:
+ACT 3:
+SETPIECES: (bullets)
+FINAL HOOK: (1 line)
+X POST: (<= 280 chars)
+`.trim(),
+    POST_KIT: `
+Output format:
+HOOK: (1 line)
+CAPTION OPTIONS: (3 variants)
+THREAD OUTLINE: (5 bullets max)
+HASHTAGS: (up to 8)
+IMAGE PROMPT: (1 short prompt)
+X POST: (<= 280 chars)
+`.trim(),
+  }[mode] || "Output format: clean structured response + X POST."
+
+  return `${BASE_PERSONA}\n\n${toneRules}\n\n${modeRules}`
+}
+
+function extractOutputText(respJson) {
+  const output = respJson && respJson.output
+  if (!Array.isArray(output)) return ""
+  for (const item of output) {
+    const content = item && item.content
+    if (!Array.isArray(content)) continue
+    for (const c of content) {
+      if (c && c.type === "output_text" && typeof c.text === "string") {
+        return c.text
+      }
+    }
+  }
+  return ""
+}
+
+export default async function handler(req, res) {
+  setCors(req, res)
 
   if (req.method === "OPTIONS") {
-    // Preflight must succeed or your browser will show “Failed to fetch”
-    return res.status(204).end();
+    return res.status(204).end()
   }
 
-  // Block unknown origins (browser only)
-  if (origin && !originAllowed) {
-    return res.status(403).json({
-      ok: false,
-      error: "CORS blocked: origin not allowed",
-      origin,
-      hint: "Add this origin to ALLOWED_ORIGINS in Vercel env vars (comma-separated).",
-    });
-  }
-
-  // ---------- HEALTHCHECK ----------
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      message: "Endpoint is up. Use POST with JSON: { text, mode, tone }",
-      example: { text: "hello", mode: "OPS_BRIEF", tone: "CINEMATIC" },
-    });
+      message:
+        "Endpoint is up. Use POST with JSON: { text, mode, tone }. Example: { text:'hello', mode:'OPS_BRIEF', tone:'CINEMATIC' }",
+    })
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
+    return res.status(405).json({ ok: false, error: "Method not allowed" })
   }
 
-  // ---------- PARSE BODY ----------
-  let body = req.body;
-  if (typeof body === "string") {
-    try { body = JSON.parse(body); } catch {}
+  const key = (process.env.OPENAI_API_KEY || "").trim()
+  if (!key) {
+    return res.status(500).json({
+      ok: false,
+      error: "Missing OPENAI_API_KEY in Vercel env vars.",
+    })
   }
 
-  const text = (body?.text || "").toString().trim();
-  const mode = (body?.mode || "OPS_BRIEF").toString().trim();
-  const tone = (body?.tone || "CINEMATIC").toString().trim();
+  const body = readJsonBody(req)
+  if (!body) {
+    return res.status(400).json({ ok: false, error: "Invalid JSON body." })
+  }
+
+  const text = String(body.text || "").trim()
+  const mode = String(body.mode || "OPS_BRIEF").trim()
+  const tone = String(body.tone || "CINEMATIC").trim()
+  const personaOverride = body.persona ? String(body.persona) : ""
 
   if (!text) {
-    return res.status(400).json({ ok: false, error: "Missing 'text'." });
+    return res.status(400).json({ ok: false, error: "Missing 'text'." })
+  }
+  if (text.length > 5000) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Text too long (max 5000 chars)." })
   }
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ ok: false, error: "Missing OPENAI_API_KEY env var." });
-  }
+  const model = (process.env.OPENAI_MODEL || "gpt-4.1-mini").trim()
+  const instructions = buildInstructions({ mode, tone, personaOverride })
 
-  // ---------- PROMPT / PERSONA ----------
-  const system = `
-You are PSYOPANIME AI TERMINAL.
-You output in a crisp, anime-ops intelligence style.
-
-RULES:
-- Always respond in the format for the selected MODE.
-- Keep it punchy, structured, and thematic (anime intel / episode framing / post kit).
-- Do not mention that you are an AI model. Do not mention policies.
-- If user input is vague, infer reasonable details but label assumptions clearly.
-
-MODES:
-OPS_BRIEF:
-- TITLE:
-- SUMMARY:
-- KEY FACTS: (3–6 bullets)
-- RISK / ANGLE: (2–4 bullets)
-- NEXT ACTION: (2–4 bullets)
-
-EPISODE_OUTLINE:
-- EP TITLE:
-- COLD OPEN (2–4 lines)
-- ACT 1 / ACT 2 / ACT 3 (each 3–6 bullets)
-- CLIFFHANGER (1–2 lines)
-
-POST_KIT:
-- HOOK (1 line)
-- MAIN POST (max ~6 lines)
-- ALT HOOKS (3 bullets)
-- HASHTAGS (5–10)
-- X POST: (<=280 chars if possible)
-`.trim();
-
-  const user = `
-MODE: ${mode}
-TONE: ${tone}
-
-INPUT:
-${text}
-`.trim();
-
-  // ---------- CALL OPENAI (Responses API) ----------
   try {
-    const r = await fetch("https://api.openai.com/v1/responses", {
+    const r = await fetch(OPENAI_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${key}`,
       },
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || "gpt-5-nano",
-        input: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        // keep outputs reasonable
-        max_output_tokens: 700,
+        model,
+        input: text,
+        instructions,
+        // keep outputs readable + consistent
+        temperature: 0.8,
+        text: { format: { type: "text" } },
+        max_output_tokens: 900,
       }),
-    });
+    })
 
-    const data = await r.json().catch(() => null);
-
-    if (!r.ok) {
-      return res.status(r.status).json({
-        ok: false,
-        error: data?.error?.message || data?.error || "OpenAI request failed",
-        status: r.status,
-        raw: data,
-      });
+    const raw = await r.text()
+    let data = null
+    try {
+      data = JSON.parse(raw)
+    } catch {
+      // leave as null
     }
 
-    // Extract text across common shapes (future-proof)
-    const pickText = (d) => {
-      if (!d) return "";
-      if (typeof d.output_text === "string") return d.output_text;
-      if (Array.isArray(d.output)) {
-        let out = "";
-        for (const item of d.output) {
-          const content = item?.content;
-          if (Array.isArray(content)) {
-            for (const c of content) {
-              if (c?.type === "output_text" && typeof c?.text === "string") out += c.text;
-              if (c?.type === "text" && typeof c?.text === "string") out += c.text;
-            }
-          }
-        }
-        if (out.trim()) return out.trim();
+    if (!r.ok) {
+      // pass through 429 cleanly (this is what your Framer cooldown reads)
+      if (r.status === 429) {
+        return res.status(429).json({
+          ok: false,
+          error: "Rate limited by model/provider. Retry shortly.",
+          retry_after_seconds: 25,
+          details: data || raw,
+        })
       }
-      // chat-completions fallback
-      const cc = d?.choices?.[0]?.message?.content;
-      if (typeof cc === "string") return cc;
-      return "";
-    };
 
-    const result = pickText(data);
+      return res.status(r.status).json({
+        ok: false,
+        error:
+          (data && data.error && data.error.message) ||
+          (data && data.message) ||
+          `Upstream error (${r.status})`,
+        details: data || raw,
+      })
+    }
 
-    return res.status(200).json({ ok: true, result });
+    const outText = extractOutputText(data) || ""
+    return res.status(200).json({
+      ok: true,
+      result: outText,
+    })
   } catch (e) {
     return res.status(500).json({
       ok: false,
-      error: "Server exception calling OpenAI",
-      detail: String(e?.message || e),
-    });
+      error: "Server crashed while calling OpenAI.",
+      details: String(e?.message || e),
+    })
   }
 }
