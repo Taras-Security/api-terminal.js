@@ -1,191 +1,111 @@
-// api/terminal.js
-// Vercel Serverless Function (Node 18+)
-
-const OPENAI_URL = "https://api.openai.com/v1/responses";
-
-// ---- super simple in-memory rate limit (best-effort on serverless) ----
-const getStore = () => {
-  if (!globalThis.__PSYOP_RL__) globalThis.__PSYOP_RL__ = new Map();
-  return globalThis.__PSYOP_RL__;
-};
-
-function getClientIp(req) {
-  const xf = req.headers["x-forwarded-for"];
-  if (typeof xf === "string" && xf.length) return xf.split(",")[0].trim();
-  return req.socket?.remoteAddress || "unknown";
-}
-
-function parseAllowedOrigins() {
-  const raw = (process.env.ALLOWED_ORIGINS || "").trim();
-  if (!raw) return [];
-  return raw.split(",").map(s => s.trim()).filter(Boolean);
-}
-
-function setCors(req, res) {
-  const origin = req.headers.origin || "";
-  const allowList = parseAllowedOrigins();
-
-  // If no allowlist set, reflect origin (works for Framer) or fall back to "*"
-  let allowOrigin = "*";
-  if (allowList.length > 0) {
-    allowOrigin = allowList.includes(origin) ? origin : allowList[0];
-  } else if (origin) {
-    allowOrigin = origin;
-  }
-
-  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS,GET");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-function json(res, status, body) {
-  res.statusCode = status;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(body));
-}
-
-function buildPrompt({ text, mode, tone }) {
-  const persona = [
-    "You are **PSYOPANIME AI TERMINAL**.",
-    "Your job: turn user input into anime-flavored intelligence-style output.",
-    "Style rules:",
-    "- Keep it themed (anime ops vibe), but do NOT invent concrete facts.",
-    "- If info is missing, say 'UNKNOWN' or 'UNCONFIRMED'.",
-    "- No calls to violence, no hate, no targeted persuasion. Keep it neutral.",
-    "- Be concise and structured. No rambling.",
-  ].join("\n");
-
-  const toneMap = {
-    CINEMATIC: "Cinematic, high-stakes, dramatic but still clear.",
-    SERIOUS: "Straight serious analyst tone. Minimal flair.",
-    UNHINGED: "Chaotic anime terminal energy, but still readable + structured.",
-  };
-
-  const modeBlocks = {
-    OPS_BRIEF: [
-      "Return exactly these sections:",
-      "TITLE:",
-      "SUMMARY: (2–4 lines)",
-      "KEY FACTS: (bullets, mark unknowns)",
-      "RISK / ANGLE: (bullets)",
-      "NEXT ACTION: (bullets, neutral)",
-    ].join("\n"),
-    EPISODE_OUTLINE: [
-      "Return exactly these sections:",
-      "EPISODE TITLE:",
-      "COLD OPEN: (2–4 lines)",
-      "SCENES: (5–9 numbered beats)",
-      "TWIST:",
-      "CLIFFHANGER:",
-    ].join("\n"),
-    POST_KIT: [
-      "Return exactly these sections:",
-      "X POST: (<= 280 chars, no hashtags unless user asked)",
-      "ALT POSTS: (2 variants, <= 200 chars each)",
-      "HOOKS: (5 bullets)",
-      "SAFE DISCLAIMERS: (1–2 short lines if topic is sensitive)",
-    ].join("\n"),
-  };
-
-  return [
-    persona,
-    "",
-    `TONE: ${tone} — ${toneMap[tone] || toneMap.CINEMATIC}`,
-    `MODE: ${mode}`,
-    modeBlocks[mode] || modeBlocks.OPS_BRIEF,
-    "",
-    "USER INPUT:",
-    text,
-  ].join("\n");
-}
-
+// /api/terminal.js
 export default async function handler(req, res) {
-  setCors(req, res);
+  // ---- CORS (THIS is what your browser needs) ----
+  const origin = req.headers.origin || "";
+  const allowList = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
 
-  // Preflight
+  // If you set ALLOWED_ORIGINS, we’ll only allow those. If you didn’t, allow all.
+  const allowedOrigin =
+    allowList.length === 0 ? "*" :
+    allowList.includes(origin) ? origin :
+    allowList[0]; // fallback
+
+  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST,GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  // Preflight request (browser sends this BEFORE your POST)
   if (req.method === "OPTIONS") {
-    res.statusCode = 204;
-    return res.end();
+    return res.status(204).end();
   }
 
-  // Helpful GET so you stop confusing yourself with “method not allowed”
+  // Health check
   if (req.method === "GET") {
-    return json(res, 200, {
+    return res.status(200).json({
       ok: true,
       message: "Endpoint is up. Use POST with JSON: { text, mode, tone }",
-      example: { text: "hello", mode: "OPS_BRIEF", tone: "CINEMATIC" },
+      example: { text: "hello", mode: "OPS_BRIEF", tone: "CINEMATIC" }
     });
   }
 
   if (req.method !== "POST") {
-    return json(res, 405, { ok: false, error: "Method not allowed" });
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  // Rate limit (10 req/min per IP)
-  const ip = getClientIp(req);
-  const store = getStore();
-  const now = Date.now();
-  const windowMs = 60_000;
-  const limit = 10;
-
-  const rec = store.get(ip) || { start: now, count: 0 };
-  if (now - rec.start > windowMs) {
-    rec.start = now;
-    rec.count = 0;
+  // ---- Parse body ----
+  let body = req.body;
+  if (!body || typeof body === "string") {
+    try { body = JSON.parse(body || "{}"); } catch { body = {}; }
   }
-  rec.count += 1;
-  store.set(ip, rec);
 
-  if (rec.count > limit) {
-    const retry = Math.ceil((rec.start + windowMs - now) / 1000);
-    return json(res, 429, { ok: false, error: "Rate limited", retry_after_seconds: retry });
+  const text = String(body.text || "").trim();
+  const mode = String(body.mode || "OPS_BRIEF").trim();
+  const tone = String(body.tone || "CINEMATIC").trim();
+
+  if (!text) {
+    return res.status(400).json({ ok: false, error: "Missing 'text'" });
   }
+
+  // ---- OpenAI call (Responses API) ----
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) {
+    return res.status(500).json({ ok: false, error: "Missing OPENAI_API_KEY on server" });
+  }
+
+  // Persona / format control (edit this to taste)
+  const instructions = [
+    "You are PsyopAnime AI Terminal. Output must be anime / ops / intelligence themed.",
+    "Stay fictional and entertainment-focused. Do NOT claim real-world intel.",
+    "Always follow the requested MODE and TONE.",
+    "",
+    `MODE: ${mode}`,
+    `TONE: ${tone}`,
+    "",
+    "Format:",
+    "TITLE:",
+    "SUMMARY:",
+    "KEY FACTS:",
+    "RISK / ANGLE:",
+    "NEXT ACTION:",
+    "",
+    "For POST_KIT also include an 'X POST:' section (<= 280 chars)."
+  ].join("\n");
 
   try {
-    const apiKey = (process.env.OPENAI_API_KEY || "").trim();
-    if (!apiKey) return json(res, 500, { ok: false, error: "Missing OPENAI_API_KEY env var" });
-
-    const body =
-      typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
-    const text = String(body.text || "").trim();
-    const mode = String(body.mode || "OPS_BRIEF").trim();
-    const tone = String(body.tone || "CINEMATIC").trim();
-
-    if (!text) return json(res, 400, { ok: false, error: "Missing text" });
-
-    const model = (process.env.OPENAI_MODEL || "gpt-5.2").trim();
-    const input = buildPrompt({ text, mode, tone });
-
-    const r = await fetch(OPENAI_URL, {
+    const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        "Authorization": `Bearer ${key}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model,
-        input,
+        model: process.env.OPENAI_MODEL || "gpt-5",
+        instructions,
+        input: text,
       }),
     });
 
-    const raw = await r.text();
-    let data = null;
-    try { data = JSON.parse(raw); } catch {}
+    const data = await r.json().catch(() => null);
 
     if (!r.ok) {
-      const msg =
-        data?.error?.message ||
-        data?.error ||
-        data?.message ||
-        raw ||
-        `OpenAI error (${r.status})`;
-      return json(res, r.status, { ok: false, error: msg });
+      return res.status(r.status).json({
+        ok: false,
+        error: data?.error?.message || data?.message || "OpenAI request failed",
+        raw: data || null,
+      });
     }
 
-    const out = String(data?.output_text || "").trim();
-    return json(res, 200, { ok: true, result: out });
+    // OpenAI Responses returns text in output_text
+    // (docs show response.output_text usage) :contentReference[oaicite:1]{index=1}
+    const result = String(data?.output_text || "").trim();
+
+    return res.status(200).json({ ok: true, result });
   } catch (e) {
-    return json(res, 500, { ok: false, error: e?.message || "Server error" });
+    return res.status(500).json({ ok: false, error: "Server crashed", detail: String(e) });
   }
 }
