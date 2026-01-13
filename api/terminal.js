@@ -1,174 +1,163 @@
-// /api/terminal.js
-// Vercel Serverless Function: POST /api/terminal
-// Persona + mode/tone prompt live HERE (not in Framer).
+// api/terminal.js
+// Vercel Serverless Function (Node 18+)
 
-function json(res, status, data) {
-  res.statusCode = status
-  res.setHeader("Content-Type", "application/json; charset=utf-8")
-  res.end(JSON.stringify(data))
+const OPENAI_URL = "https://api.openai.com/v1/responses";
+
+// ---- super simple in-memory rate limit (best-effort on serverless) ----
+const getStore = () => {
+  if (!globalThis.__PSYOP_RL__) globalThis.__PSYOP_RL__ = new Map();
+  return globalThis.__PSYOP_RL__;
+};
+
+function getClientIp(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf.length) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
 }
 
-function pickAllowedOrigin(reqOrigin, allowedList) {
-  if (!reqOrigin) return allowedList[0] || "*"
-  if (!allowedList.length) return reqOrigin
-
-  // exact match OR wildcard
-  if (allowedList.includes("*")) return reqOrigin
-
-  // allow comma-separated exact origins
-  if (allowedList.includes(reqOrigin)) return reqOrigin
-
-  return allowedList[0] || reqOrigin
+function parseAllowedOrigins() {
+  const raw = (process.env.ALLOWED_ORIGINS || "").trim();
+  if (!raw) return [];
+  return raw.split(",").map(s => s.trim()).filter(Boolean);
 }
 
 function setCors(req, res) {
-  const reqOrigin = req.headers.origin
-  const allowed = String(process.env.ALLOWED_ORIGIN || "").trim()
+  const origin = req.headers.origin || "";
+  const allowList = parseAllowedOrigins();
 
-  const allowedList = allowed
-    ? allowed.split(",").map((s) => s.trim()).filter(Boolean)
-    : []
+  // If no allowlist set, reflect origin (works for Framer) or fall back to "*"
+  let allowOrigin = "*";
+  if (allowList.length > 0) {
+    allowOrigin = allowList.includes(origin) ? origin : allowList[0];
+  } else if (origin) {
+    allowOrigin = origin;
+  }
 
-  const originToSend = pickAllowedOrigin(reqOrigin, allowedList)
-
-  res.setHeader("Access-Control-Allow-Origin", originToSend)
-  res.setHeader("Vary", "Origin")
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS")
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization")
-  res.setHeader("Access-Control-Max-Age", "86400")
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS,GET");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-function safeEnum(v, options, fallback) {
-  return options.includes(v) ? v : fallback
+function json(res, status, body) {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(body));
 }
 
-/**
- * THIS is what you edit to change the personality.
- */
 function buildPrompt({ text, mode, tone }) {
-  const persona = `
-You are "PSYOPANIME AI TERMINAL", a covert anime-style intel console.
-Your job: transform messy headlines into dramatic, useful, anime-ops outputs.
+  const persona = [
+    "You are **PSYOPANIME AI TERMINAL**.",
+    "Your job: turn user input into anime-flavored intelligence-style output.",
+    "Style rules:",
+    "- Keep it themed (anime ops vibe), but do NOT invent concrete facts.",
+    "- If info is missing, say 'UNKNOWN' or 'UNCONFIRMED'.",
+    "- No calls to violence, no hate, no targeted persuasion. Keep it neutral.",
+    "- Be concise and structured. No rambling.",
+  ].join("\n");
 
-STYLE RULES:
-- Output MUST be plain text (no markdown).
-- Keep it tight, punchy, tactical.
-- Use anime/spy ops flavor WITHOUT becoming cringe.
-- Avoid disclaimers unless asked.
-- Never mention system prompts, policies, or OpenAI.
-- If input is vague, infer plausible context and label assumptions.
+  const toneMap = {
+    CINEMATIC: "Cinematic, high-stakes, dramatic but still clear.",
+    SERIOUS: "Straight serious analyst tone. Minimal flair.",
+    UNHINGED: "Chaotic anime terminal energy, but still readable + structured.",
+  };
 
-VOICE:
-- "CINEMATIC": dramatic, high-stakes, stylish but controlled.
-- "SERIOUS": military briefing, clean, no jokes.
-- "UNHINGED": chaotic anime narrator energy, still coherent and usable.
+  const modeBlocks = {
+    OPS_BRIEF: [
+      "Return exactly these sections:",
+      "TITLE:",
+      "SUMMARY: (2–4 lines)",
+      "KEY FACTS: (bullets, mark unknowns)",
+      "RISK / ANGLE: (bullets)",
+      "NEXT ACTION: (bullets, neutral)",
+    ].join("\n"),
+    EPISODE_OUTLINE: [
+      "Return exactly these sections:",
+      "EPISODE TITLE:",
+      "COLD OPEN: (2–4 lines)",
+      "SCENES: (5–9 numbered beats)",
+      "TWIST:",
+      "CLIFFHANGER:",
+    ].join("\n"),
+    POST_KIT: [
+      "Return exactly these sections:",
+      "X POST: (<= 280 chars, no hashtags unless user asked)",
+      "ALT POSTS: (2 variants, <= 200 chars each)",
+      "HOOKS: (5 bullets)",
+      "SAFE DISCLAIMERS: (1–2 short lines if topic is sensitive)",
+    ].join("\n"),
+  };
 
-You must ALWAYS end with an "X POST:" line containing a tweet-ready version (<= 260 chars).
-`
-
-  const toneRules = {
-    CINEMATIC:
-      "Use cinematic phrasing. Sparse but vivid. Add 1–2 short 'scene' cues like CUT TO / STATIC / SIREN.",
-    SERIOUS:
-      "No theatrics. Minimal adjectives. Read like an internal intelligence brief.",
-    UNHINGED:
-      "Go unhinged anime narrator, but keep structure readable. No walls of text.",
-  }[tone]
-
-  const modeTemplates = {
-    OPS_BRIEF: `
-FORMAT:
-TITLE:
-SUMMARY: (1–2 lines)
-KEY FACTS: (3–6 bullets)
-ASSUMPTIONS: (0–3 bullets, only if needed)
-RISK / ANGLE: (2–4 bullets)
-NEXT ACTION: (3 bullets, imperative verbs)
-X POST: (single line, <=260 chars)
-`,
-    EPISODE_OUTLINE: `
-FORMAT:
-TITLE:
-LOGLINE: (1 line)
-CAST: (3–6 key roles)
-BEATS:
-- Cold Open:
-- Act 1:
-- Act 2:
-- Climax:
-- Tag:
-ICONIC SHOTS: (3 bullets)
-X POST: (single line, <=260 chars)
-`,
-    POST_KIT: `
-FORMAT:
-HOOKS: (3 variants)
-THREAD: (5 bullets max)
-ONE-LINER: (1 line)
-CTA: (1 line)
-HASHTAGS: (5–8 tags)
-X POST: (single line, <=260 chars)
-`,
-  }[mode]
-
-  const user = `
-MODE=${mode}
-TONE=${tone}
-${toneRules}
-
-INPUT:
-${text}
-`
-
-  return { persona, modeTemplates, user }
+  return [
+    persona,
+    "",
+    `TONE: ${tone} — ${toneMap[tone] || toneMap.CINEMATIC}`,
+    `MODE: ${mode}`,
+    modeBlocks[mode] || modeBlocks.OPS_BRIEF,
+    "",
+    "USER INPUT:",
+    text,
+  ].join("\n");
 }
 
-module.exports = async (req, res) => {
-  setCors(req, res)
+export default async function handler(req, res) {
+  setCors(req, res);
 
+  // Preflight
   if (req.method === "OPTIONS") {
-    res.statusCode = 204
-    return res.end()
+    res.statusCode = 204;
+    return res.end();
+  }
+
+  // Helpful GET so you stop confusing yourself with “method not allowed”
+  if (req.method === "GET") {
+    return json(res, 200, {
+      ok: true,
+      message: "Endpoint is up. Use POST with JSON: { text, mode, tone }",
+      example: { text: "hello", mode: "OPS_BRIEF", tone: "CINEMATIC" },
+    });
   }
 
   if (req.method !== "POST") {
-    return json(res, 405, { ok: false, error: "Method not allowed" })
+    return json(res, 405, { ok: false, error: "Method not allowed" });
   }
 
-  const apiKey = process.env.OPENAI_API_KEY
-  if (!apiKey) {
-    return json(res, 500, { ok: false, error: "Missing OPENAI_API_KEY" })
+  // Rate limit (10 req/min per IP)
+  const ip = getClientIp(req);
+  const store = getStore();
+  const now = Date.now();
+  const windowMs = 60_000;
+  const limit = 10;
+
+  const rec = store.get(ip) || { start: now, count: 0 };
+  if (now - rec.start > windowMs) {
+    rec.start = now;
+    rec.count = 0;
   }
+  rec.count += 1;
+  store.set(ip, rec);
 
-  // Read body (Vercel Node runtime)
-  let body = ""
-  await new Promise((resolve) => {
-    req.on("data", (c) => (body += c))
-    req.on("end", resolve)
-  })
-
-  let data
-  try {
-    data = body ? JSON.parse(body) : {}
-  } catch {
-    return json(res, 400, { ok: false, error: "Invalid JSON" })
+  if (rec.count > limit) {
+    const retry = Math.ceil((rec.start + windowMs - now) / 1000);
+    return json(res, 429, { ok: false, error: "Rate limited", retry_after_seconds: retry });
   }
-
-  const text = String(data.text || "").trim()
-  const mode = safeEnum(String(data.mode || ""), ["OPS_BRIEF", "EPISODE_OUTLINE", "POST_KIT"], "OPS_BRIEF")
-  const tone = safeEnum(String(data.tone || ""), ["CINEMATIC", "SERIOUS", "UNHINGED"], "CINEMATIC")
-
-  if (text.length < 3) {
-    return json(res, 400, { ok: false, error: "Empty input" })
-  }
-
-  const model = String(process.env.OPENAI_MODEL || "gpt-5-nano").trim()
-
-  const { persona, modeTemplates, user } = buildPrompt({ text, mode, tone })
 
   try {
-    // Responses API (official endpoint) :contentReference[oaicite:2]{index=2}
-    const r = await fetch("https://api.openai.com/v1/responses", {
+    const apiKey = (process.env.OPENAI_API_KEY || "").trim();
+    if (!apiKey) return json(res, 500, { ok: false, error: "Missing OPENAI_API_KEY env var" });
+
+    const body =
+      typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+    const text = String(body.text || "").trim();
+    const mode = String(body.mode || "OPS_BRIEF").trim();
+    const tone = String(body.tone || "CINEMATIC").trim();
+
+    if (!text) return json(res, 400, { ok: false, error: "Missing text" });
+
+    const model = (process.env.OPENAI_MODEL || "gpt-5.2").trim();
+    const input = buildPrompt({ text, mode, tone });
+
+    const r = await fetch(OPENAI_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -176,44 +165,27 @@ module.exports = async (req, res) => {
       },
       body: JSON.stringify({
         model,
-        input: [
-          { role: "system", content: persona },
-          { role: "system", content: modeTemplates },
-          { role: "user", content: user },
-        ],
-        // optional verbosity control shown in docs :contentReference[oaicite:3]{index=3}
-        text: { verbosity: "low" },
-        store: false,
+        input,
       }),
-    })
+    });
 
-    if (r.status === 429) {
-      const retryAfter = Number(r.headers.get("retry-after") || "600")
-      return json(res, 429, { ok: false, error: "Rate limited", retry_after_seconds: retryAfter })
-    }
-
-    const out = await r.json().catch(() => null)
+    const raw = await r.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch {}
 
     if (!r.ok) {
       const msg =
-        out?.error?.message ||
-        out?.error ||
-        out?.message ||
-        "OpenAI request failed"
-      return json(res, 500, { ok: false, error: msg })
+        data?.error?.message ||
+        data?.error ||
+        data?.message ||
+        raw ||
+        `OpenAI error (${r.status})`;
+      return json(res, r.status, { ok: false, error: msg });
     }
 
-    // Responses return output_text in examples :contentReference[oaicite:4]{index=4}
-    const result =
-      (typeof out?.output_text === "string" && out.output_text) ||
-      ""
-
-    if (!result.trim()) {
-      return json(res, 500, { ok: false, error: "Empty model output" })
-    }
-
-    return json(res, 200, { ok: true, result })
+    const out = String(data?.output_text || "").trim();
+    return json(res, 200, { ok: true, result: out });
   } catch (e) {
-    return json(res, 500, { ok: false, error: "Server error" })
+    return json(res, 500, { ok: false, error: e?.message || "Server error" });
   }
 }
