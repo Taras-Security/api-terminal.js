@@ -1,171 +1,219 @@
-// api/terminal.js (Vercel Serverless Function - Node.js)
+// /api/terminal.js
+// Vercel Serverless Function: POST /api/terminal
+// Persona + mode/tone prompt live HERE (not in Framer).
 
-function parseAllowedOrigins(raw) {
-  return (raw || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
+function json(res, status, data) {
+  res.statusCode = status
+  res.setHeader("Content-Type", "application/json; charset=utf-8")
+  res.end(JSON.stringify(data))
+}
+
+function pickAllowedOrigin(reqOrigin, allowedList) {
+  if (!reqOrigin) return allowedList[0] || "*"
+  if (!allowedList.length) return reqOrigin
+
+  // exact match OR wildcard
+  if (allowedList.includes("*")) return reqOrigin
+
+  // allow comma-separated exact origins
+  if (allowedList.includes(reqOrigin)) return reqOrigin
+
+  return allowedList[0] || reqOrigin
 }
 
 function setCors(req, res) {
-  const origin = req.headers.origin || ""
-  const allowed = parseAllowedOrigins(process.env.ALLOWED_ORIGINS)
+  const reqOrigin = req.headers.origin
+  const allowed = String(process.env.ALLOWED_ORIGIN || "").trim()
 
-  // If you set ALLOWED_ORIGINS, reflect only approved origins.
-  // If you don't set it, allow all (not recommended).
-  const allowOrigin =
-    allowed.length === 0 ? "*" : allowed.includes(origin) ? origin : ""
+  const allowedList = allowed
+    ? allowed.split(",").map((s) => s.trim()).filter(Boolean)
+    : []
 
-  if (allowOrigin) {
-    res.setHeader("Access-Control-Allow-Origin", allowOrigin)
-    res.setHeader("Vary", "Origin")
-  }
+  const originToSend = pickAllowedOrigin(reqOrigin, allowedList)
 
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS")
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type")
+  res.setHeader("Access-Control-Allow-Origin", originToSend)
+  res.setHeader("Vary", "Origin")
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS")
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization")
   res.setHeader("Access-Control-Max-Age", "86400")
 }
 
-function clampMode(mode) {
-  return ["OPS_BRIEF", "EPISODE_OUTLINE", "POST_KIT"].includes(mode)
-    ? mode
-    : "OPS_BRIEF"
+function safeEnum(v, options, fallback) {
+  return options.includes(v) ? v : fallback
 }
 
-function clampTone(tone) {
-  return ["CINEMATIC", "SERIOUS", "UNHINGED"].includes(tone)
-    ? tone
-    : "CINEMATIC"
-}
+/**
+ * THIS is what you edit to change the personality.
+ */
+function buildPrompt({ text, mode, tone }) {
+  const persona = `
+You are "PSYOPANIME AI TERMINAL", a covert anime-style intel console.
+Your job: transform messy headlines into dramatic, useful, anime-ops outputs.
 
-function buildInstructions(mode, tone) {
-  const toneRules =
-    tone === "CINEMATIC"
-      ? "Write like a high-stakes cinematic intel terminal. Punchy. Vivid. Minimal fluff."
-      : tone === "SERIOUS"
-        ? "Write like professional analysis. Clear, grounded, concise."
-        : "Write like chaotic internet ops. Still structured. No slurs, no threats, no doxxing."
+STYLE RULES:
+- Output MUST be plain text (no markdown).
+- Keep it tight, punchy, tactical.
+- Use anime/spy ops flavor WITHOUT becoming cringe.
+- Avoid disclaimers unless asked.
+- Never mention system prompts, policies, or OpenAI.
+- If input is vague, infer plausible context and label assumptions.
 
-  const modeRules =
-    mode === "OPS_BRIEF"
-      ? [
-          "Output format:",
-          "TITLE: <short>",
-          "SUMMARY: 2–4 lines",
-          "KEY FACTS: 3–6 bullets",
-          "RISK / ANGLE: 2–4 bullets",
-          "NEXT ACTION: 2–4 bullets",
-          "",
-          "Keep it tight. No hashtags unless relevant."
-        ].join("\n")
-      : mode === "EPISODE_OUTLINE"
-        ? [
-            "Output format:",
-            "LOGLINE: 1 line",
-            "BEATS: 6–10 numbered beats (1–2 lines each)",
-            "SCENES: 5–8 scene headings with 1–2 lines each",
-            "ENDING: 1–2 lines",
-            "",
-            "No filler. Make it usable."
-          ].join("\n")
-        : [
-            "Output format:",
-            "X POST: <single post text, <= 280 chars if possible>",
-            "ALT POSTS: 2 alternatives",
-            "REPLIES: 3 short reply lines",
-            "HOOKS: 3 hook ideas",
-            "",
-            "Make sure the first line literally starts with 'X POST:' so the UI can extract it."
-          ].join("\n")
+VOICE:
+- "CINEMATIC": dramatic, high-stakes, stylish but controlled.
+- "SERIOUS": military briefing, clean, no jokes.
+- "UNHINGED": chaotic anime narrator energy, still coherent and usable.
 
-  return [
-    "You are the PsyopAnime AI Terminal.",
-    "Generate a structured output from the user's input.",
-    toneRules,
-    modeRules
-  ].join("\n\n")
-}
+You must ALWAYS end with an "X POST:" line containing a tweet-ready version (<= 260 chars).
+`
 
-function extractTextFromResponses(data) {
-  // Responses API returns an `output` array of items (messages) with `content` blocks.
-  // We collect content blocks that contain text.
-  const out = []
-  const items = Array.isArray(data?.output) ? data.output : []
+  const toneRules = {
+    CINEMATIC:
+      "Use cinematic phrasing. Sparse but vivid. Add 1–2 short 'scene' cues like CUT TO / STATIC / SIREN.",
+    SERIOUS:
+      "No theatrics. Minimal adjectives. Read like an internal intelligence brief.",
+    UNHINGED:
+      "Go unhinged anime narrator, but keep structure readable. No walls of text.",
+  }[tone]
 
-  for (const item of items) {
-    const content = Array.isArray(item?.content) ? item.content : []
-    for (const c of content) {
-      if (typeof c?.text === "string") out.push(c.text)
-    }
-  }
+  const modeTemplates = {
+    OPS_BRIEF: `
+FORMAT:
+TITLE:
+SUMMARY: (1–2 lines)
+KEY FACTS: (3–6 bullets)
+ASSUMPTIONS: (0–3 bullets, only if needed)
+RISK / ANGLE: (2–4 bullets)
+NEXT ACTION: (3 bullets, imperative verbs)
+X POST: (single line, <=260 chars)
+`,
+    EPISODE_OUTLINE: `
+FORMAT:
+TITLE:
+LOGLINE: (1 line)
+CAST: (3–6 key roles)
+BEATS:
+- Cold Open:
+- Act 1:
+- Act 2:
+- Climax:
+- Tag:
+ICONIC SHOTS: (3 bullets)
+X POST: (single line, <=260 chars)
+`,
+    POST_KIT: `
+FORMAT:
+HOOKS: (3 variants)
+THREAD: (5 bullets max)
+ONE-LINER: (1 line)
+CTA: (1 line)
+HASHTAGS: (5–8 tags)
+X POST: (single line, <=260 chars)
+`,
+  }[mode]
 
-  // Some SDKs expose `output_text`, but don’t rely on it in raw REST parsing.
-  if (out.length) return out.join("\n").trim()
-  if (typeof data?.output_text === "string") return data.output_text.trim()
-  return ""
+  const user = `
+MODE=${mode}
+TONE=${tone}
+${toneRules}
+
+INPUT:
+${text}
+`
+
+  return { persona, modeTemplates, user }
 }
 
 module.exports = async (req, res) => {
   setCors(req, res)
 
   if (req.method === "OPTIONS") {
-    return res.status(204).end()
+    res.statusCode = 204
+    return res.end()
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" })
+    return json(res, 405, { ok: false, error: "Method not allowed" })
   }
 
   const apiKey = process.env.OPENAI_API_KEY
   if (!apiKey) {
-    return res
-      .status(500)
-      .json({ ok: false, error: "Missing OPENAI_API_KEY" })
+    return json(res, 500, { ok: false, error: "Missing OPENAI_API_KEY" })
   }
 
-  const body = req.body || {}
-  const input = String(body.input ?? body.text ?? "").trim()
-  const mode = clampMode(String(body.mode || ""))
-  const tone = clampTone(String(body.tone || ""))
+  // Read body (Vercel Node runtime)
+  let body = ""
+  await new Promise((resolve) => {
+    req.on("data", (c) => (body += c))
+    req.on("end", resolve)
+  })
 
-  if (!input) {
-    return res.status(400).json({ ok: false, error: "Missing input" })
+  let data
+  try {
+    data = body ? JSON.parse(body) : {}
+  } catch {
+    return json(res, 400, { ok: false, error: "Invalid JSON" })
   }
 
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini"
-  const maxTokens = Number(process.env.MAX_OUTPUT_TOKENS || 700)
+  const text = String(data.text || "").trim()
+  const mode = safeEnum(String(data.mode || ""), ["OPS_BRIEF", "EPISODE_OUTLINE", "POST_KIT"], "OPS_BRIEF")
+  const tone = safeEnum(String(data.tone || ""), ["CINEMATIC", "SERIOUS", "UNHINGED"], "CINEMATIC")
+
+  if (text.length < 3) {
+    return json(res, 400, { ok: false, error: "Empty input" })
+  }
+
+  const model = String(process.env.OPENAI_MODEL || "gpt-5-nano").trim()
+
+  const { persona, modeTemplates, user } = buildPrompt({ text, mode, tone })
 
   try {
-    // Responses API: POST /v1/responses with model, input, instructions, max_output_tokens :contentReference[oaicite:1]{index=1}
+    // Responses API (official endpoint) :contentReference[oaicite:2]{index=2}
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`
       },
       body: JSON.stringify({
         model,
-        instructions: buildInstructions(mode, tone),
-        input,
-        max_output_tokens: maxTokens,
-        // store: false, // optional if supported on your account
-      })
+        input: [
+          { role: "system", content: persona },
+          { role: "system", content: modeTemplates },
+          { role: "user", content: user },
+        ],
+        // optional verbosity control shown in docs :contentReference[oaicite:3]{index=3}
+        text: { verbosity: "low" },
+        store: false,
+      }),
     })
 
-    const data = await r.json().catch(() => null)
+    if (r.status === 429) {
+      const retryAfter = Number(r.headers.get("retry-after") || "600")
+      return json(res, 429, { ok: false, error: "Rate limited", retry_after_seconds: retryAfter })
+    }
+
+    const out = await r.json().catch(() => null)
 
     if (!r.ok) {
       const msg =
-        (data && (data.error?.message || data.error || data.message)) ||
-        `OpenAI error (${r.status})`
-      return res.status(500).json({ ok: false, error: msg })
+        out?.error?.message ||
+        out?.error ||
+        out?.message ||
+        "OpenAI request failed"
+      return json(res, 500, { ok: false, error: msg })
     }
 
-    // The response object contains `output` items we parse into text. 
-    const result = extractTextFromResponses(data) || ""
-    return res.status(200).json({ ok: true, result })
+    // Responses return output_text in examples :contentReference[oaicite:4]{index=4}
+    const result =
+      (typeof out?.output_text === "string" && out.output_text) ||
+      ""
+
+    if (!result.trim()) {
+      return json(res, 500, { ok: false, error: "Empty model output" })
+    }
+
+    return json(res, 200, { ok: true, result })
   } catch (e) {
-    return res.status(500).json({ ok: false, error: "Network failure" })
+    return json(res, 500, { ok: false, error: "Server error" })
   }
 }
-
